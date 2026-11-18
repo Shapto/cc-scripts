@@ -1,25 +1,34 @@
--- cannon.lua - auto-aim for a Create Big Cannons mount using CC:CBC
+-- cannon.lua - auto-aim for one or more Create Big Cannons mounts using CC:CBC
+--
+-- Connect every cannon mount with wired modems (right-click each modem to activate it).
+-- All connected cannons aim at the same target, each with its own angles.
 --
 -- Commands:
---   cannon aim <x> <y> <z> [options]   aim at a block
---   cannon plan <x> <y> <z>            list pitches for every power level (cartridges)
---   cannon fire                        fire with the current aim
---   cannon info                        show what the mount reports
+--   cannon aim <x> <y> <z> [options]   aim all cannons at a block
+--   cannon plan <x> <y> <z>            list pitches for every power level (cartridges), per cannon
+--   cannon fire [stagger=S]            fire all cannons with their current aim
+--   cannon list                        show connected cannons
+--   cannon info                        show what each mount reports
 --
 -- Options for "aim" (any order):
---   fire        fire once on target
+--   fire        fire once all cannons are on target
 --   steep       use the high arc instead of the flat one
 --   power=N     big cartridge with N power (1-4)
 --   charges=N   N powder charges
---   lob         power-4 cartridge on the highest arc (refuses flat shots)
+--   lob         power-4 cartridge on the highest arc (cannons that can't lob are skipped)
+--   stagger=S   wait S seconds between each cannon's shot (default: all at once)
+--   only=NAME   use just one cannon (name from "cannon list")
 --
 -- Examples:
 --   cannon aim -265 82 -511 power=4 fire
---   cannon aim 64 70 -5 power=1 steep fire
---   cannon aim -265 82 -511 lob fire
+--   cannon aim -265 82 -511 lob fire stagger=0.5
 
 ---------------- CONFIG ----------------
-local CANNON_LENGTH = 4                    -- block held by the mount to muzzle, both included
+local DEFAULT_CANNON_LENGTH = 4            -- block held by the mount to muzzle, both included
+local CANNON_LENGTHS = {                   -- per-cannon lengths, if some cannons are different
+    -- ["cannon_mount_0"] = 4,
+    -- ["cannon_mount_1"] = 6,
+}
 local DEFAULT_POWER = 4                    -- used when you don't give power= or charges=
 local POWER_PER_CARTRIDGE_LEVEL = 2        -- big cartridges (normal CBC, confirmed by test shot)
 local POWER_PER_POWDER_CHARGE = 3.315      -- powder charges in your pack (one test shot)
@@ -40,10 +49,22 @@ local atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
 local chargeCount = DEFAULT_POWER
 local powerPerCharge = POWER_PER_CARTRIDGE_LEVEL
 
-local cannonMount = peripheral.find("cannon_mount")
-if not cannonMount then
-    printError("No cannon mount found. Put the computer next to the mount or connect it with a wired modem.")
-    return
+---------------- FIND CANNONS ----------------
+local function findCannons(onlyName)
+    local cannons = {}
+    for _, peripheralName in ipairs(peripheral.getNames()) do
+        if peripheral.hasType(peripheralName, "cannon_mount") then
+            if not onlyName or peripheralName == onlyName then
+                table.insert(cannons, {
+                    name = peripheralName,
+                    mount = peripheral.wrap(peripheralName),
+                    length = CANNON_LENGTHS[peripheralName] or DEFAULT_CANNON_LENGTH,
+                })
+            end
+        end
+    end
+    table.sort(cannons, function(firstCannon, secondCannon) return firstCannon.name < secondCannon.name end)
+    return cannons
 end
 
 ---------------- BALLISTICS ----------------
@@ -77,8 +98,8 @@ local function calculateYaw(cannonPosition, target)
 end
 
 -- Returns a list of pitch solutions (lowest first) and an airtime function
-local function calculatePitches(cannonPosition, target, muzzleSpeed)
-    local muzzleOffset = math.max(CANNON_LENGTH - 1, 0)
+local function calculatePitches(cannonPosition, target, muzzleSpeed, cannonLength)
+    local muzzleOffset = math.max(cannonLength - 1, 0)
     local horizontalDistance = math.sqrt((target.x - cannonPosition.x) ^ 2 + (target.z - cannonPosition.z) ^ 2)
     local heightDifference = target.y - cannonPosition.y
 
@@ -120,8 +141,8 @@ local function calculatePitches(cannonPosition, target, muzzleSpeed)
 end
 
 ---------------- CANNON CONTROL ----------------
-local function getCannonPosition()
-    local mountInfo = cannonMount.getInfo()
+local function getCannonPosition(cannon)
+    local mountInfo = cannon.mount.getInfo()
     return { x = mountInfo.x, y = mountInfo.y + HELD_BLOCK_HEIGHT_ABOVE_MOUNT, z = mountInfo.z }
 end
 
@@ -129,10 +150,10 @@ local function angleDifference(firstAngle, secondAngle)
     return math.abs((firstAngle - secondAngle + 540) % 360 - 180)
 end
 
-local function waitUntilAimed(targetYaw, targetPitch)
+local function waitUntilAimed(cannon, targetYaw, targetPitch)
     local startTime = os.clock()
     while os.clock() - startTime < AIM_TIMEOUT_SECONDS do
-        local mountInfo = cannonMount.getInfo()
+        local mountInfo = cannon.mount.getInfo()
         if angleDifference(mountInfo.yaw, targetYaw) <= AIM_TOLERANCE_DEGREES and math.abs(mountInfo.pitch - targetPitch) <= AIM_TOLERANCE_DEGREES then
             return true
         end
@@ -141,54 +162,85 @@ local function waitUntilAimed(targetYaw, targetPitch)
     return false
 end
 
-local function fire()
-    cannonMount.fire(true)
+local function fireCannon(cannon)
+    cannon.mount.fire(true)
     sleep(0.1)
-    cannonMount.fire(false)
-    print("Fired!")
+    cannon.mount.fire(false)
+    print(cannon.name .. ": fired!")
 end
 
-local function aimAt(target, preferSteep, lobMode)
-    local mountInfo = cannonMount.getInfo()
+local function fireAll(cannons, staggerSeconds)
+    if staggerSeconds and staggerSeconds > 0 then
+        for cannonIndex, cannon in ipairs(cannons) do
+            fireCannon(cannon)
+            if cannonIndex < #cannons then sleep(staggerSeconds) end
+        end
+        return
+    end
+    local fireTasks = {}
+    for _, cannon in ipairs(cannons) do
+        table.insert(fireTasks, function() fireCannon(cannon) end)
+    end
+    parallel.waitForAll(table.unpack(fireTasks))
+end
+
+-- Works out the angles for one cannon. Returns a firing solution or nil (and prints why)
+local function solveForCannon(cannon, target, preferSteep, lobMode)
+    local mountInfo = cannon.mount.getInfo()
     if not mountInfo.assembled then
-        print("Assembling cannon...")
-        cannonMount.assemble(true)
+        print(cannon.name .. ": assembling...")
+        cannon.mount.assemble(true)
         sleep(0.5)
     end
 
-    local cannonPosition = getCannonPosition()
+    local cannonPosition = getCannonPosition(cannon)
     local targetYaw = calculateYaw(cannonPosition, target)
-    local pitchSolutions, airtime = calculatePitches(cannonPosition, target, chargeCount * powerPerCharge)
+    local pitchSolutions, airtime = calculatePitches(cannonPosition, target, chargeCount * powerPerCharge, cannon.length)
     if #pitchSolutions == 0 then
-        printError("Target out of range (or needs a pitch outside " .. MINIMUM_PITCH .. ".." .. MAXIMUM_PITCH .. ").")
-        return false
+        printError(cannon.name .. ": target out of range.")
+        return nil
     end
 
     local chosenPitch = preferSteep and pitchSolutions[#pitchSolutions] or pitchSolutions[1]
-
-    -- Lob mode: only fire if there is a real high arc within the mount's range
     if lobMode and (#pitchSolutions < 2 or chosenPitch < LOB_MINIMUM_PITCH) then
-        printError(("No high arc with a power-4 cartridge (best is %.2f, too flat)."):format(chosenPitch))
-        print("Target is too close for lobbing at power 4 - use 'cannon plan' to pick a lower power.")
-        return false
+        printError(("%s: too close to lob at power 4 (best %.2f)"):format(cannon.name, chosenPitch))
+        return nil
     end
 
-    cannonMount.setComputerControl(true)
-    cannonMount.setTargetAngles(targetYaw, chosenPitch)
-    print(("Aiming: yaw %.2f, pitch %.2f (power %d)"):format(targetYaw, chosenPitch, chargeCount))
-    if #pitchSolutions > 1 then
-        print(("Other arc: pitch %.2f"):format(preferSteep and pitchSolutions[1] or pitchSolutions[#pitchSolutions]))
+    return { cannon = cannon, yaw = targetYaw, pitch = chosenPitch, airtimeTicks = airtime(chosenPitch) }
+end
+
+-- Aims every cannon at once. Returns the list of cannons that are on target
+local function aimAll(cannons, target, preferSteep, lobMode)
+    local firingSolutions = {}
+    for _, cannon in ipairs(cannons) do
+        local firingSolution = solveForCannon(cannon, target, preferSteep, lobMode)
+        if firingSolution then
+            cannon.mount.setComputerControl(true)
+            cannon.mount.setTargetAngles(firingSolution.yaw, firingSolution.pitch)
+            print(("%s: yaw %.2f, pitch %.2f, %.1fs flight"):format(cannon.name, firingSolution.yaw, firingSolution.pitch, firingSolution.airtimeTicks / 20))
+            table.insert(firingSolutions, firingSolution)
+        end
     end
 
-    if not waitUntilAimed(targetYaw, chosenPitch) then
-        local finalInfo = cannonMount.getInfo()
-        printError(("Didn't reach the target angles in time (now yaw %.2f, pitch %.2f). Is the mount powered?"):format(finalInfo.yaw, finalInfo.pitch))
-        return false
+    local readyCannons = {}
+    local waitTasks = {}
+    for _, firingSolution in ipairs(firingSolutions) do
+        table.insert(waitTasks, function()
+            if waitUntilAimed(firingSolution.cannon, firingSolution.yaw, firingSolution.pitch) then
+                table.insert(readyCannons, firingSolution.cannon)
+            else
+                printError(firingSolution.cannon.name .. ": didn't reach its angles in time. Is it powered?")
+            end
+        end)
+    end
+    if #waitTasks > 0 then
+        parallel.waitForAll(table.unpack(waitTasks))
     end
 
-    local airtimeTicks = airtime(chosenPitch)
-    print(("On target. Airtime %.1f ticks (%.2fs), fuze %d"):format(airtimeTicks, airtimeTicks / 20, math.max(1, math.floor(airtimeTicks) - 10)))
-    return true
+    table.sort(readyCannons, function(firstCannon, secondCannon) return firstCannon.name < secondCannon.name end)
+    print(("%d of %d cannons on target."):format(#readyCannons, #cannons))
+    return readyCannons
 end
 
 local function readTarget()
@@ -197,13 +249,27 @@ local function readTarget()
     return target
 end
 
+local function readNamedOption(optionName)
+    for argumentIndex = 2, #arguments do
+        local optionValue = string.match(arguments[argumentIndex], "^" .. optionName .. "=(.+)$")
+        if optionValue then return optionValue end
+    end
+    return nil
+end
+
 ---------------- COMMANDS ----------------
 local command = arguments[1]
+local cannons = findCannons(readNamedOption("only"))
+
+if command ~= nil and #cannons == 0 then
+    printError("No cannon mounts found. Connect them with wired modems (right-click each modem to activate it).")
+    return
+end
 
 if command == "aim" then
     local target = readTarget()
     if not target then
-        printError("Usage: cannon aim <x> <y> <z> [fire] [steep] [power=N] [charges=N] [lob]")
+        printError("Usage: cannon aim <x> <y> <z> [fire] [steep] [power=N] [charges=N] [lob] [stagger=S] [only=NAME]")
         return
     end
 
@@ -230,8 +296,9 @@ if command == "aim" then
         end
     end
 
-    if aimAt(target, preferSteep, lobMode) and shouldFire then
-        fire()
+    local readyCannons = aimAll(cannons, target, preferSteep, lobMode)
+    if shouldFire and #readyCannons > 0 then
+        fireAll(readyCannons, tonumber(readNamedOption("stagger")))
     end
 
 elseif command == "plan" then
@@ -240,29 +307,40 @@ elseif command == "plan" then
         printError("Usage: cannon plan <x> <y> <z>")
         return
     end
-    local cannonPosition = getCannonPosition()
-    print(("Yaw %.2f  (big cartridge power levels)"):format(calculateYaw(cannonPosition, target)))
-    for testedPower = 1, 4 do
-        local pitchSolutions = calculatePitches(cannonPosition, target, testedPower * POWER_PER_CARTRIDGE_LEVEL)
-        if #pitchSolutions == 0 then
-            print(("power=%d: out of range"):format(testedPower))
-        elseif #pitchSolutions == 1 then
-            print(("power=%d: %.2f"):format(testedPower, pitchSolutions[1]))
-        else
-            print(("power=%d: %.2f / steep %.2f"):format(testedPower, pitchSolutions[1], pitchSolutions[#pitchSolutions]))
+    for _, cannon in ipairs(cannons) do
+        local cannonPosition = getCannonPosition(cannon)
+        print(("%s - yaw %.2f"):format(cannon.name, calculateYaw(cannonPosition, target)))
+        for testedPower = 1, 4 do
+            local pitchSolutions = calculatePitches(cannonPosition, target, testedPower * POWER_PER_CARTRIDGE_LEVEL, cannon.length)
+            if #pitchSolutions == 0 then
+                print(("  power=%d: out of range"):format(testedPower))
+            elseif #pitchSolutions == 1 then
+                print(("  power=%d: %.2f"):format(testedPower, pitchSolutions[1]))
+            else
+                print(("  power=%d: %.2f / steep %.2f"):format(testedPower, pitchSolutions[1], pitchSolutions[#pitchSolutions]))
+            end
         end
     end
 
 elseif command == "fire" then
-    fire()
+    fireAll(cannons, tonumber(readNamedOption("stagger")))
+
+elseif command == "list" then
+    for _, cannon in ipairs(cannons) do
+        local cannonPosition = getCannonPosition(cannon)
+        print(("%s at %d %d %d (length %d)"):format(cannon.name, cannonPosition.x, cannonPosition.y, cannonPosition.z, cannon.length))
+    end
 
 elseif command == "info" then
-    for fieldName, fieldValue in pairs(cannonMount.getInfo()) do
-        print(fieldName .. " = " .. tostring(fieldValue))
+    for _, cannon in ipairs(cannons) do
+        print("== " .. cannon.name .. " ==")
+        for fieldName, fieldValue in pairs(cannon.mount.getInfo()) do
+            print("  " .. fieldName .. " = " .. tostring(fieldValue))
+        end
     end
 
 else
-    print("cannon aim <x> <y> <z> [fire] [steep] [power=N] [charges=N] [lob]")
+    print("cannon aim <x> <y> <z> [fire] [steep] [power=N] [charges=N] [lob] [stagger=S] [only=NAME]")
     print("cannon plan <x> <y> <z>")
-    print("cannon fire | cannon info")
+    print("cannon fire [stagger=S] | cannon list | cannon info")
 end
